@@ -6,34 +6,37 @@
 from __future__ import print_function
 
 import datetime
+import math
 import os
 import shutil
-import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
-try:
-    from subprocess import DEVNULL
-except ImportError:
-    DEVNULL = open(os.devnull, 'wb')
+from PIL import Image
+
+from vcsi.media.mediainfo import MediaInfo
+from vcsi.media.util import *
+from vcsi.media.mediacapture import MediaCapture
+
+from .config import FALLBACK_FONTS, DEFAULT_FRAME_TYPE, DEFAULT_METADATA_MARGIN, DEFAULT_CONTACT_SHEET_WIDTH, \
+    DEFAULT_CONFIG_FILE, Config
+from vcsi.error import error_exit
+
 import argparse
 import configparser
-import json
-import math
 import tempfile
 import textwrap
-from collections import namedtuple
-from enum import Enum
 from glob import glob
 from glob import escape
 
-from PIL import Image, ImageDraw, ImageFont
-import numpy
+from PIL import ImageDraw, ImageFont
 from jinja2 import Template
 import texttable
 import parsedatetime
 from tqdm import tqdm
+
+from .media import *
 
 here = os.path.abspath(os.path.dirname(__file__))
 
@@ -43,582 +46,7 @@ __version__ = VERSION
 __author__ = "Nils Amiet"
 
 
-class Grid(namedtuple('Grid', ['x', 'y'])):
-    def __str__(self):
-        return "%sx%s" % (self.x, self.y)
-
-
-class Frame(namedtuple('Frame', ['filename', 'blurriness', 'timestamp', 'avg_color'])):
-    pass
-
-
-class Color(namedtuple('Color', ['r', 'g', 'b', 'a'])):
-    def to_hex(self, component):
-        h = hex(component).replace("0x", "").upper()
-        return h if len(h) == 2 else "0" + h
-
-    def __str__(self):
-        return "".join([self.to_hex(x) for x in [self.r, self.g, self.b, self.a]])
-
-
-TimestampPosition = Enum('TimestampPosition', "north south east west ne nw se sw center")
 VALID_TIMESTAMP_POSITIONS = [x.name for x in TimestampPosition]
-
-DEFAULT_CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".config/vcsi.conf")
-DEFAULT_CONFIG_SECTION = "vcsi"
-
-DEFAULT_METADATA_FONT_SIZE = 16
-DEFAULT_TIMESTAMP_FONT_SIZE = 12
-
-# Defaults
-DEFAULT_METADATA_FONT = "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"
-DEFAULT_TIMESTAMP_FONT = "/usr/share/fonts/TTF/DejaVuSans.ttf"
-FALLBACK_FONTS = ["/Library/Fonts/Arial Unicode.ttf"]
-
-# Replace defaults on Windows to support unicode/CJK and multiple fallbacks
-if os.name == 'nt':
-    DEFAULT_METADATA_FONT = "C:/Windows/Fonts/msgothic.ttc"
-    DEFAULT_TIMESTAMP_FONT = "C:/Windows/Fonts/msgothic.ttc"
-    FALLBACK_FONTS = [
-        "C:/Windows/Fonts/simsun.ttc",
-        "C:/Windows/Fonts/Everson Mono.ttf",
-        "C:/Windows/Fonts/calibri.ttf",
-        "C:/Windows/Fonts/arial.ttf"
-    ]
-
-DEFAULT_CONTACT_SHEET_WIDTH = 1500
-DEFAULT_DELAY_PERCENT = None
-DEFAULT_START_DELAY_PERCENT = 7
-DEFAULT_END_DELAY_PERCENT = DEFAULT_START_DELAY_PERCENT
-DEFAULT_GRID_SPACING = None
-DEFAULT_GRID_HORIZONTAL_SPACING = 5
-DEFAULT_GRID_VERTICAL_SPACING = DEFAULT_GRID_HORIZONTAL_SPACING
-DEFAULT_METADATA_POSITION = "top"
-DEFAULT_METADATA_FONT_COLOR = "ffffff"
-DEFAULT_BACKGROUND_COLOR = "000000"
-DEFAULT_TIMESTAMP_FONT_COLOR = "ffffff"
-DEFAULT_TIMESTAMP_BACKGROUND_COLOR = "000000aa"
-DEFAULT_TIMESTAMP_BORDER_COLOR = "000000"
-DEFAULT_TIMESTAMP_BORDER_SIZE = 1
-DEFAULT_ACCURATE_DELAY_SECONDS = 1
-DEFAULT_METADATA_MARGIN = 10
-DEFAULT_METADATA_HORIZONTAL_MARGIN = DEFAULT_METADATA_MARGIN
-DEFAULT_METADATA_VERTICAL_MARGIN = DEFAULT_METADATA_MARGIN
-DEFAULT_CAPTURE_ALPHA = 255
-DEFAULT_GRID_SIZE = Grid(4, 4)
-DEFAULT_TIMESTAMP_HORIZONTAL_PADDING = 3
-DEFAULT_TIMESTAMP_VERTICAL_PADDING = 1
-DEFAULT_TIMESTAMP_HORIZONTAL_MARGIN = 5
-DEFAULT_TIMESTAMP_VERTICAL_MARGIN = 5
-DEFAULT_IMAGE_QUALITY = 100
-DEFAULT_IMAGE_FORMAT = "jpg"
-DEFAULT_TIMESTAMP_POSITION = TimestampPosition.se
-DEFAULT_FRAME_TYPE = None
-DEFAULT_INTERVAL = None
-
-
-class Config:
-    metadata_font_size = DEFAULT_METADATA_FONT_SIZE
-    metadata_font = DEFAULT_METADATA_FONT
-    timestamp_font_size = DEFAULT_TIMESTAMP_FONT_SIZE
-    timestamp_font = DEFAULT_TIMESTAMP_FONT
-    fallback_fonts = FALLBACK_FONTS
-    contact_sheet_width = DEFAULT_CONTACT_SHEET_WIDTH
-    delay_percent = DEFAULT_DELAY_PERCENT
-    start_delay_percent = DEFAULT_START_DELAY_PERCENT
-    end_delay_percent = DEFAULT_END_DELAY_PERCENT
-    grid_spacing = DEFAULT_GRID_SPACING
-    grid_horizontal_spacing = DEFAULT_GRID_HORIZONTAL_SPACING
-    grid_vertical_spacing = DEFAULT_GRID_VERTICAL_SPACING
-    metadata_position = DEFAULT_METADATA_POSITION
-    metadata_font_color = DEFAULT_METADATA_FONT_COLOR
-    background_color = DEFAULT_BACKGROUND_COLOR
-    timestamp_font_color = DEFAULT_TIMESTAMP_FONT_COLOR
-    timestamp_background_color = DEFAULT_TIMESTAMP_BACKGROUND_COLOR
-    timestamp_border_color = DEFAULT_TIMESTAMP_BORDER_COLOR
-    timestamp_border_size = DEFAULT_TIMESTAMP_BORDER_SIZE
-    accurate_delay_seconds = DEFAULT_ACCURATE_DELAY_SECONDS
-    metadata_margin = DEFAULT_METADATA_MARGIN
-    metadata_horizontal_margin = DEFAULT_METADATA_HORIZONTAL_MARGIN
-    metadata_vertical_margin = DEFAULT_METADATA_VERTICAL_MARGIN
-    capture_alpha = DEFAULT_CAPTURE_ALPHA
-    grid_size = DEFAULT_GRID_SIZE
-    timestamp_horizontal_padding = DEFAULT_TIMESTAMP_HORIZONTAL_PADDING
-    timestamp_vertical_padding = DEFAULT_TIMESTAMP_VERTICAL_PADDING
-    timestamp_horizontal_margin = DEFAULT_TIMESTAMP_HORIZONTAL_MARGIN
-    timestamp_vertical_margin = DEFAULT_TIMESTAMP_VERTICAL_MARGIN
-    quality = DEFAULT_IMAGE_QUALITY
-    format = DEFAULT_IMAGE_FORMAT
-    timestamp_position = DEFAULT_TIMESTAMP_POSITION
-    frame_type = DEFAULT_FRAME_TYPE
-    interval = DEFAULT_INTERVAL
-
-    @classmethod
-    def load_configuration(cls, filename=DEFAULT_CONFIG_FILE):
-        config = configparser.ConfigParser(default_section=DEFAULT_CONFIG_SECTION)
-        config.read(filename)
-
-        for config_entry in cls.__dict__.keys():
-            # skip magic attributes
-            if config_entry.startswith('__'):
-                continue
-            setattr(cls, config_entry, config.get(
-                DEFAULT_CONFIG_SECTION,
-                config_entry,
-                fallback=getattr(cls, config_entry)
-            ))
-        # special cases
-        # fallback_fonts is an array, it's reflected as comma separated list in config file
-        fallback_fonts = config.get(DEFAULT_CONFIG_SECTION, 'fallback_fonts', fallback=None)
-        if fallback_fonts:
-            cls.fallback_fonts = comma_separated_string_type(fallback_fonts)
-
-
-class MediaInfo(object):
-    """Collect information about a video file
-    """
-
-    def __init__(self, path, verbose=False):
-        self.probe_media(path)
-        self.find_video_stream()
-        self.find_audio_stream()
-        self.compute_display_resolution()
-        self.compute_format()
-        self.parse_attributes()
-
-        if verbose:
-            print(self.filename)
-            print("%sx%s" % (self.sample_width, self.sample_height))
-            print("%sx%s" % (self.display_width, self.display_height))
-            print(self.duration)
-            print(self.size)
-
-    def probe_media(self, path):
-        """Probe video file using ffprobe
-        """
-        ffprobe_command = [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            "--",
-            path
-        ]
-
-        try:
-            output = subprocess.check_output(ffprobe_command)
-            self.ffprobe_dict = json.loads(output.decode("utf-8"))
-        except FileNotFoundError:
-            error = "Could not find 'ffprobe' executable. Please make sure ffmpeg/ffprobe is installed and is in your PATH."
-            error_exit(error)
-
-    def human_readable_size(self, num, suffix='B'):
-        """Converts a number of bytes to a human readable format
-        """
-        for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
-            if abs(num) < 1024.0:
-                return "%3.1f %s%s" % (num, unit, suffix)
-            num /= 1024.0
-        return "%.1f %s%s" % (num, 'Yi', suffix)
-
-    def find_video_stream(self):
-        """Find the first stream which is a video stream
-        """
-        for stream in self.ffprobe_dict["streams"]:
-            try:
-                if stream["codec_type"] == "video":
-                    self.video_stream = stream
-                    break
-            except:
-                pass
-
-    def find_audio_stream(self):
-        """Find the first stream which is an audio stream
-        """
-        for stream in self.ffprobe_dict["streams"]:
-            try:
-                if stream["codec_type"] == "audio":
-                    self.audio_stream = stream
-                    break
-            except:
-                pass
-
-    def compute_display_resolution(self):
-        """Computes the display resolution.
-        Some videos have a sample resolution that differs from the display resolution
-        (non-square pixels), thus the proper display resolution has to be computed.
-        """
-        self.sample_width = int(self.video_stream["width"])
-        self.sample_height = int(self.video_stream["height"])
-
-        # videos recorded with a smartphone may have a "rotate" flag
-        try:
-            rotation = int(self.video_stream["tags"]["rotate"])
-        except KeyError:
-            rotation = None
-
-        if rotation in [90, 270]:
-            # swap width and height
-            self.sample_width, self.sample_height = self.sample_height, self.sample_width
-
-        sample_aspect_ratio = "1:1"
-        try:
-            sample_aspect_ratio = self.video_stream["sample_aspect_ratio"]
-        except KeyError:
-            pass
-
-        if sample_aspect_ratio == "1:1":
-            self.display_width = self.sample_width
-            self.display_height = self.sample_height
-        else:
-            sample_split = sample_aspect_ratio.split(":")
-            sw = int(sample_split[0])
-            sh = int(sample_split[1])
-
-            self.display_width = int(self.sample_width * sw / sh)
-            self.display_height = int(self.sample_height)
-
-        if self.display_width == 0:
-            self.display_width = self.sample_width
-
-        if self.display_height == 0:
-            self.display_height = self.sample_height
-
-    def compute_format(self):
-        """Compute duration, size and retrieve filename
-        """
-        format_dict = self.ffprobe_dict["format"]
-
-        try:
-            # try getting video stream duration first
-            self.duration_seconds = float(self.video_stream["duration"])
-        except (KeyError, AttributeError):
-            # otherwise fallback to format duration
-            self.duration_seconds = float(format_dict["duration"])
-
-        self.duration = MediaInfo.pretty_duration(self.duration_seconds)
-
-        self.filename = os.path.basename(format_dict["filename"])
-
-        self.size_bytes = int(format_dict["size"])
-        self.size = self.human_readable_size(self.size_bytes)
-
-    @staticmethod
-    def pretty_to_seconds(
-            pretty_duration):
-        """Converts pretty printed timestamp to seconds
-        """
-        millis_split = pretty_duration.split(".")
-        millis = 0
-        if len(millis_split) == 2:
-            millis = int(millis_split[1])
-            left = millis_split[0]
-        else:
-            left = pretty_duration
-
-        left_split = left.split(":")
-        if len(left_split) < 3:
-            hours = 0
-            minutes = int(left_split[0])
-            seconds = int(left_split[1])
-        else:
-            hours = int(left_split[0])
-            minutes = int(left_split[1])
-            seconds = int(left_split[2])
-
-        result = (millis / 1000.0) + seconds + minutes * 60 + hours * 3600
-        return result
-
-    @staticmethod
-    def pretty_duration(
-            seconds,
-            show_centis=False,
-            show_millis=False):
-        """Converts seconds to a human readable time format
-        """
-        hours = int(math.floor(seconds / 3600))
-        remaining_seconds = seconds - 3600 * hours
-
-        minutes = math.floor(remaining_seconds / 60)
-        remaining_seconds = remaining_seconds - 60 * minutes
-
-        duration = ""
-
-        if hours > 0:
-            duration += "%s:" % (int(hours),)
-
-        duration += "%s:%s" % (str(int(minutes)).zfill(2), str(int(math.floor(remaining_seconds))).zfill(2))
-
-        if show_centis or show_millis:
-            coeff = 1000 if show_millis else 100
-            digits = 3 if show_millis else 2
-            centis = math.floor((remaining_seconds - math.floor(remaining_seconds)) * coeff)
-            duration += ".%s" % (str(int(centis)).zfill(digits))
-
-        return duration
-
-    @staticmethod
-    def parse_duration(seconds):
-        hours = int(math.floor(seconds / 3600))
-        remaining_seconds = seconds - 3600 * hours
-
-        minutes = math.floor(remaining_seconds / 60)
-        remaining_seconds = remaining_seconds - 60 * minutes
-        seconds = math.floor(remaining_seconds)
-
-        millis = math.floor((remaining_seconds - math.floor(remaining_seconds)) * 1000)
-        centis = math.floor((remaining_seconds - math.floor(remaining_seconds)) * 100)
-
-        return {
-            "hours": hours,
-            "minutes": minutes,
-            "seconds": seconds,
-            "centis": centis,
-            "millis": millis
-        }
-
-    def desired_size(self, width=Config.contact_sheet_width):
-        """Computes the height based on a given width and fixed aspect ratio.
-        Returns (width, height)
-        """
-        ratio = width / float(self.display_width)
-        desired_height = int(math.floor(self.display_height * ratio))
-        return (width, desired_height)
-
-    def parse_attributes(self):
-        """Parse multiple media attributes
-        """
-        # video
-        try:
-            self.video_codec = self.video_stream["codec_name"]
-        except KeyError:
-            self.video_codec = None
-
-        try:
-            self.video_codec_long = self.video_stream["codec_long_name"]
-        except KeyError:
-            self.video_codec_long = None
-
-        try:
-            self.sample_aspect_ratio = self.video_stream["sample_aspect_ratio"]
-        except KeyError:
-            self.sample_aspect_ratio = None
-
-        try:
-            self.display_aspect_ratio = self.video_stream["display_aspect_ratio"]
-        except KeyError:
-            self.display_aspect_ratio = None
-
-        try:
-            self.frame_rate = self.video_stream["avg_frame_rate"]
-            splits = self.frame_rate.split("/")
-
-            if len(splits) == 2:
-                self.frame_rate = int(splits[0]) / int(splits[1])
-            else:
-                self.frame_rate = int(self.frame_rate)
-
-            self.frame_rate = round(self.frame_rate, 3)
-        except KeyError:
-            self.frame_rate = None
-        except ZeroDivisionError:
-            self.frame_rate = None
-
-        # audio
-        try:
-            self.audio_codec = self.audio_stream["codec_name"]
-        except (KeyError, AttributeError):
-            self.audio_codec = None
-
-        try:
-            self.audio_codec_long = self.audio_stream["codec_long_name"]
-        except (KeyError, AttributeError):
-            self.audio_codec_long = None
-
-        try:
-            self.audio_sample_rate = int(self.audio_stream["sample_rate"])
-        except (KeyError, AttributeError):
-            self.audio_sample_rate = None
-
-        try:
-            self.audio_bit_rate = int(self.audio_stream["bit_rate"])
-        except (KeyError, AttributeError):
-            self.audio_bit_rate = None
-
-    def template_attributes(self):
-        """Returns the template attributes and values ready for use in the metadata header
-        """
-        return dict((x["name"], getattr(self, x["name"])) for x in MediaInfo.list_template_attributes())
-
-    @staticmethod
-    def list_template_attributes():
-        """Returns a list a of all supported template attributes with their description and example
-        """
-        table = []
-        table.append({"name": "size", "description": "File size (pretty format)", "example": "128.3 MiB"})
-        table.append({"name": "size_bytes", "description": "File size (bytes)", "example": "4662788373"})
-        table.append({"name": "filename", "description": "File name", "example": "video.mkv"})
-        table.append({"name": "duration", "description": "Duration (pretty format)", "example": "03:07"})
-        table.append({"name": "sample_width", "description": "Sample width (pixels)", "example": "1920"})
-        table.append({"name": "sample_height", "description": "Sample height (pixels)", "example": "1080"})
-        table.append({"name": "display_width", "description": "Display width (pixels)", "example": "1920"})
-        table.append({"name": "display_height", "description": "Display height (pixels)", "example": "1080"})
-        table.append({"name": "video_codec", "description": "Video codec", "example": "h264"})
-        table.append({"name": "video_codec_long", "description": "Video codec (long name)",
-                      "example": "H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"})
-        table.append({"name": "display_aspect_ratio", "description": "Display aspect ratio", "example": "16:9"})
-        table.append({"name": "sample_aspect_ratio", "description": "Sample aspect ratio", "example": "1:1"})
-        table.append({"name": "audio_codec", "description": "Audio codec", "example": "aac"})
-        table.append({"name": "audio_codec_long", "description": "Audio codec (long name)",
-                      "example": "AAC (Advanced Audio Coding)"})
-        table.append({"name": "audio_sample_rate", "description": "Audio sample rate (Hz)", "example": "44100"})
-        table.append({"name": "audio_bit_rate", "description": "Audio bit rate (bits/s)", "example": "192000"})
-        table.append({"name": "frame_rate", "description": "Frame rate (frames/s)", "example": "23.974"})
-        return table
-
-
-class MediaCapture(object):
-    """Capture frames of a video
-    """
-
-    def __init__(self, path, accurate=False, skip_delay_seconds=Config.accurate_delay_seconds,
-                 frame_type=Config.frame_type):
-        self.path = path
-        self.accurate = accurate
-        self.skip_delay_seconds = skip_delay_seconds
-        self.frame_type = frame_type
-
-    def make_capture(self, time, width, height, out_path="out.png"):
-        """Capture a frame at given time with given width and height using ffmpeg
-        """
-        skip_delay = MediaInfo.pretty_duration(self.skip_delay_seconds, show_millis=True)
-
-        ffmpeg_command = [
-            "ffmpeg",
-            "-ss", time,
-            "-i", self.path,
-            "-vframes", "1",
-            "-s", "%sx%s" % (width, height),
-        ]
-
-        if self.frame_type is not None:
-            select_args = [
-                "-vf", "select='eq(frame_type\\," + self.frame_type + ")'"
-            ]
-
-        if self.frame_type == "key":
-            select_args = [
-                "-vf", "select=key"
-            ]
-
-        if self.frame_type is not None:
-            ffmpeg_command += select_args
-
-        ffmpeg_command += [
-            "-y",
-            out_path
-        ]
-
-        if self.accurate:
-            time_seconds = MediaInfo.pretty_to_seconds(time)
-            skip_time_seconds = time_seconds - self.skip_delay_seconds
-
-            if skip_time_seconds < 0:
-                ffmpeg_command = [
-                    "ffmpeg",
-                    "-i", self.path,
-                    "-ss", time,
-                    "-vframes", "1",
-                    "-s", "%sx%s" % (width, height),
-                ]
-
-                if self.frame_type is not None:
-                    ffmpeg_command += select_args
-
-                ffmpeg_command += [
-                    "-y",
-                    out_path
-                ]
-            else:
-                skip_time = MediaInfo.pretty_duration(skip_time_seconds, show_millis=True)
-                ffmpeg_command = [
-                    "ffmpeg",
-                    "-ss", skip_time,
-                    "-i", self.path,
-                    "-ss", skip_delay,
-                    "-vframes", "1",
-                    "-s", "%sx%s" % (width, height),
-                ]
-
-                if self.frame_type is not None:
-                    ffmpeg_command += select_args
-
-                ffmpeg_command += [
-                    "-y",
-                    out_path
-                ]
-
-        try:
-            subprocess.call(ffmpeg_command, stderr=DEVNULL, stdout=DEVNULL)
-        except FileNotFoundError:
-            error = "Could not find 'ffmpeg' executable. Please make sure ffmpeg/ffprobe is installed and is in your PATH."
-            error_exit(error)
-
-    def compute_avg_color(self, image_path):
-        """Computes the average color of an image
-        """
-        i = Image.open(image_path)
-        i = i.convert('P')
-        p = i.getcolors()
-
-        # compute avg color
-        total_count = 0
-        avg_color = 0
-        for count, color in p:
-            total_count += count
-            avg_color += count * color
-
-        avg_color /= total_count
-
-        return avg_color
-
-    def compute_blurriness(self, image_path):
-        """Computes the blurriness of an image. Small value means less blurry.
-        """
-        i = Image.open(image_path)
-        i = i.convert('L')  # convert to grayscale
-
-        a = numpy.asarray(i)
-        b = abs(numpy.fft.rfft2(a))
-        max_freq = self.avg9x(b)
-
-        if max_freq != 0:
-            return 1 / max_freq
-        else:
-            return 1
-
-    def avg9x(self, matrix, percentage=0.05):
-        """Computes the median of the top n% highest values.
-        By default, takes the top 5%
-        """
-        xs = matrix.flatten()
-        srt = sorted(xs, reverse=True)
-        length = int(math.floor(percentage * len(srt)))
-
-        matrix_subset = srt[:length]
-        return numpy.median(matrix_subset)
-
-    def max_freq(self, matrix):
-        """Returns the maximum value in the matrix
-        """
-        m = 0
-        for row in matrix:
-            mx = max(row)
-            if mx > m:
-                m = mx
-
-        return m
 
 
 def grid_desired_size(
@@ -957,7 +385,6 @@ def compose_contact_sheet(
     final_image_width = width
     final_image_height = height + header_height
     transparent = (255, 255, 255, 0)
-
     image = Image.new("RGBA", (final_image_width, final_image_height), args.background_color)
     image_capture_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
     image_header_text_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
@@ -1235,15 +662,7 @@ def comma_separated_string_type(string):
     return splits
 
 
-def error(message):
-    """Print an error message."""
-    print("[ERROR] %s" % (message,))
 
-
-def error_exit(message):
-    """Print an error message and exit"""
-    error(message)
-    sys.exit(-1)
 
 
 def main():
@@ -1692,7 +1111,7 @@ def process_file(path, args):
     if args.interval is not None or args.manual_timestamps is not None:
         square_side = math.ceil(math.sqrt(args.num_samples))
 
-        if args.grid == DEFAULT_GRID_SIZE:
+        if args.grid is None:
             args.grid = Grid(square_side, square_side)
         elif args.grid.x == 0 and args.grid.y == 0:
             args.grid = Grid(square_side, square_side)
