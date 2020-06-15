@@ -4,8 +4,9 @@ import argparse
 from nose.tools import assert_raises
 from nose.tools import assert_equals
 
-from vcsi.vcsi import MediaInfo
-from vcsi.vcsi import Grid, grid_desired_size
+from vcsi.vcsi import grid_desired_size
+from vcsi.media.mediainfo import MediaInfo
+from vcsi.media.util import Grid
 from vcsi.vcsi import timestamp_generator
 
 

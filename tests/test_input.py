@@ -4,7 +4,8 @@ from nose.tools import assert_equals
 from nose.tools import assert_not_equals
 from nose.tools import assert_raises
 
-from vcsi.vcsi import Grid, mxn_type
+from vcsi.media.util import Grid
+from vcsi.vcsi import mxn_type
 
 
 def test_grid_default():
