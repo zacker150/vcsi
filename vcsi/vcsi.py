@@ -33,6 +33,7 @@ import numpy
 from jinja2 import Template
 import texttable
 import parsedatetime
+from tqdm import tqdm
 
 here = os.path.abspath(os.path.dirname(__file__))
 
@@ -592,7 +593,7 @@ class MediaCapture(object):
         b = abs(numpy.fft.rfft2(a))
         max_freq = self.avg9x(b)
 
-        if max_freq is not 0:
+        if max_freq != 0:
             return 1 / max_freq
         else:
             return 1
@@ -701,9 +702,6 @@ def select_sharpest_images(
         )
         return frm
 
-    blurs = []
-    futures = []
-
     if args.fast:
         suffix = ".jpg"  # faster processing time
     else:
@@ -711,22 +709,13 @@ def select_sharpest_images(
         
     # use multiple threads
     with ThreadPoolExecutor() as executor:
-        for i, timestamp_tuple in enumerate(timestamps):
-            status = "Starting task... {}/{}".format(i + 1, args.num_samples)
-            print(status, end="\r")
-            
-            future = executor.submit(do_capture, timestamp_tuple, desired_size[0], desired_size[1], suffix, args)
-            futures.append(future)
+        print("Starting tasks")
+        futures = [executor.submit(do_capture, timestamp_tuple, desired_size[0], desired_size[1], suffix, args)
+                   for timestamp_tuple in tqdm(timestamps, total=args.num_samples)]
         print()
 
-        for i, future in enumerate(futures):
-            status = "Sampling... {}/{}".format(i + 1, args.num_samples)
-            print(status, end="\r")
-            frame = future.result()
-            blurs += [
-                frame
-            ]
-        print()
+        print("Sampling")
+        blurs = [future.result() for future in tqdm(futures)]
 
     time_sorted = sorted(blurs, key=lambda x: x.timestamp)
 
