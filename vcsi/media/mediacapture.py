@@ -41,7 +41,7 @@ class MediaCapture(object):
 
         if self.frame_type is not None:
             select_args = [
-                "-vf", "select='eq(frame_type\\," + self.frame_type + ")'"
+                "-vf", "select='eq(frame_type\\,{})'".format(self.frame_type)
             ]
 
         if self.frame_type == "key":
